@@ -1,0 +1,183 @@
+#include "imports/stdlib.fc";
+#include "imports/params.fc";
+
+const int min_tons_for_storage = 100000000; ;; 0.1 ton
+
+;; seqno, public_key, owner_addr
+(int, int, slice) load_data() inline_ref {
+    slice ds = get_data().begin_parse();
+    return (
+        ds~load_uint(32),
+        ds~load_uint(256),
+        ds~load_msg_addr()
+    );
+}
+
+() store_data(int seqno, int public_key, slice owner_addr) impure inline {
+    set_data(
+        begin_cell()
+            .store_uint(seqno, 32)
+            .store_uint(public_key, 256)
+            .store_slice(owner_addr)
+        .end_cell()
+    );
+}
+
+int get_smc_balance() method_id {
+    [int balance, _] = get_balance();
+    return balance;
+}
+
+;; recv_internal
+;; 1. Update smc code
+;; 2. Transfer messages to owner
+;; 3. Deposit
+;; 4. Owner withdraw
+;; 5. Change owner
+
+;; recv_external
+;; 1. Selfdestruct
+
+() recv_internal(int my_balance, int msg_value, cell in_msg_full, slice in_msg_body) impure {
+    slice cs = in_msg_full.begin_parse();
+    int flags = cs~load_uint(4);
+    ;; if msg is bounced return
+    if (flags & 1) {
+        return ();
+    }
+    slice sender_addr = cs~load_msg_addr();
+    ;; Do not process empty messages
+    if (in_msg_body.slice_empty?()) {
+        return ();
+    }
+
+    (int seqno, int public_key, slice owner_addr) = load_data();
+
+    ;; Op codes
+    int op = in_msg_body~load_uint(32);
+    ;; Optional but better to use
+    ;; int query_id = in_msg_body~load_uint(64);
+    if (op == "deposit"c) {
+        return ();
+    }
+
+    if (op == "transfer_msg_to_owner"c) {
+        ifnot (equal_slices(sender_addr,owner_addr)) {
+            cell msg_cell = begin_cell().store_slice(in_msg_body).end_cell();
+            cell msg = begin_cell()
+                .store_uint(0x18, 6) ;; nonbouncable = 0x10, logs = 0x30
+                .store_slice(owner_addr)
+                .store_coins(0)
+                .store_uint(0, 1 + 4 + 4 + 64 + 32 + 1 + 1)
+                .store_slice(sender_addr)
+                .store_ref(msg_cell)
+            .end_cell();
+            send_raw_message(msg, 64); ;; contract will buy itself
+        };
+        return ();
+    }
+
+    throw_unless(411, equal_slices(sender_addr, owner_addr));
+
+    if (op == "change_owner"c) {
+        slice new_owner_addr = in_msg_body~load_msg_addr();
+
+        force_chain(new_owner_addr);
+        store_data(seqno, public_key, owner_addr);
+        return ();
+    }
+
+    if (op == "withdraw_funds"c) {
+        int withdraw_amount = in_msg_body~load_coins();
+
+        throw_unless(412, my_balance >= withdraw_amount);
+
+        int send_amount = min(withdraw_amount, my_balance - min_tons_for_storage);
+
+        cell msg = begin_cell()
+            .store_uint(0x18, 6)
+            .store_slice(owner_addr)
+            .store_coins(send_amount)
+            .store_uint(0, 1 + 4 + 4 + 64 + 32 + 1 + 1)
+        .end_cell();
+        send_raw_message(msg, 1);
+        return ();
+    }
+
+    if (op == "update_code"c) {
+        cell new_code = in_msg_body~load_ref();
+        set_code(new_code);
+
+
+        ;; Change code now
+        cont old_code = get_c3();
+        set_c3(new_code.begin_parse().bless());
+
+        throw(0);
+    }
+
+
+    ;; Method does not exists
+    throw(0xffffff); ;; 0xfffffe - op not allowed
+}
+
+() recv_external(slice in_msg) impure {
+    ;; First check user authorized
+    var signature = in_msg~load_bits(512);
+    slice cs = in_msg;
+    var hash = slice_hash(in_msg);
+
+    (int seqno, int public_key, slice owner_addr) = load_data();
+
+    throw_unless(401, check_signature(hash, signature, public_key));
+
+    int msg_seqno = cs~load_uint(32);
+
+    ;; Second check seqno
+    throw_unless(402, msg_seqno == seqno);
+
+    ;; Set gas limit to max, smc is ready to pay for trandsaction
+    accept_message();
+
+    ;; Set msg to the top of STACK
+    cs~touch();
+    int op = cs~load_uint(32);
+
+    if (op == "self_destruct"c) {
+        cell msg = begin_cell()
+            .store_uint(0x18, 6)
+            .store_slice(owner_addr)
+            .store_coins(0)
+            .store_uint(0, 1 + 4 + 4 + 64 + 32 + 1 + 1)
+        .end_cell();
+        send_raw_message(msg, 128 + 32);
+    }
+
+    throw(0xffffff);
+
+    ;; Update seqno
+    store_data(seqno + 1, public_key, owner_addr);
+}
+
+int get_seqno() method_id {
+    (int seqno, _, _) = load_data();
+    return seqno;
+}
+
+int get_owner() method_id {
+    (_, int owner_addr, _) = load_data();
+    return owner_addr;
+}
+
+;; () create_table(cell tables, int name) impure {
+;;     var ds = addr.begin_parse();
+;;     cell table = tables.udict_get?(256, name);
+;;     if (table) {
+
+;;     }
+;;     else {
+;;         tables~udict_add?(256, name, begin_cell().store.end_cell(b));
+;;         return table;
+;;     }
+;; }
+
